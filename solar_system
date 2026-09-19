@@ -1,0 +1,492 @@
+import math
+ 
+import matplotlib.pyplot as plt
+import numpy as np
+import taichi as ti
+ 
+ 
+# default_fp=f64 keeps every literal (G, pi, ...) in double precision inside kernels.
+ti.init(arch=ti.cpu, default_fp=ti.f64)
+ 
+# ----------------------------------------------------------------------------
+# Physical constants (SI units)
+# ----------------------------------------------------------------------------
+G = 6.67430e-11
+M_SUN = 1.98847e30
+AU = 1.495978707e11          # metres
+PI = math.pi
+ 
+# ----------------------------------------------------------------------------
+# Planet data
+#   name, mass [kg] (NASA Planetary Fact Sheet),
+#   semi-major axis a (NASA/JPL mean orbital elements, J2000, in AU),
+#   eccentricity e (NASA),
+#   longitude of perihelion [deg] (JPL J2000, sets the orientation of each ellipse),
+#   NASA sidereal orbital period [days] (used only to validate the simulation),
+#   display colour
+# ----------------------------------------------------------------------------
+PLANETS = [
+    ("Mercury", 3.3011e23,  0.38709927 * AU, 0.2056, 77.456,  87.969,    (0.65, 0.65, 0.65)),
+    ("Venus",   4.8673e24,  0.72333566 * AU, 0.0068, 131.533, 224.701,   (0.90, 0.75, 0.50)),
+    ("Earth",   5.9722e24,  1.00000261 * AU, 0.0167, 102.947, 365.256,   (0.20, 0.45, 0.95)),
+    ("Mars",    6.4169e23,  1.52371034 * AU, 0.0934, 336.056, 686.980,   (0.85, 0.35, 0.20)),
+    ("Jupiter", 1.89813e27, 5.20288700 * AU, 0.0484, 14.728,  4332.589,  (0.85, 0.65, 0.45)),
+    ("Saturn",  5.6832e26,  9.53667594 * AU, 0.0541, 92.599,  10755.699, (0.90, 0.80, 0.55)),
+    ("Uranus",  8.6811e25,  19.18916464 * AU, 0.0472, 170.954, 30687.153, (0.55, 0.85, 0.90)),
+    ("Neptune", 1.02409e26, 30.06992276 * AU, 0.0086, 44.965, 60190.03,  (0.25, 0.35, 0.90)),
+]
+NP = len(PLANETS)            # number of planets
+N = NP + 1                   # planets + Sun
+SUN_IDX = 0
+SUN_COLOR = (1.0, 0.9, 0.0)
+ 
+# ----------------------------------------------------------------------------
+# Simulation parameters
+# ----------------------------------------------------------------------------
+FIX_SUN = False
+DT = 3600.0                  # time step [s] (1 hour: ~2100 steps per Mercury orbit)
+WIDTH, HEIGHT = 800, 800
+SCALE_VIS = AU               # 1 render unit = 1 AU
+HELIOCENTRIC_VIEW = True     # draw everything relative to the Sun (orbits stay closed ellipses)
+ 
+# Trails: each planet remembers exactly one orbit, sampled TRAIL_POINTS times.
+TRAIL_POINTS = 2000
+TRAIL_FADE = True            # oldest part of the trail fades out
+TRAIL_BRIGHTNESS = 0.22      # brightness of the newest trail point (lower = darker grey)
+TRAIL_MIN_BRIGHTNESS = 0.04  # brightness of the oldest trail point
+TRAIL_RADIUS_FRAC = 0.0008   # trail dot size as a fraction of camera distance
+ 
+# Camera presets (distance from the Sun in AU)
+FULL_VIEW_RADIUS = 80.0      # whole system incl. Neptune
+INNER_VIEW_RADIUS = 4.5      # Mercury ... Mars
+ 
+# Taichi fields
+mass = ti.field(dtype=ti.f64, shape=N)
+pos = ti.Vector.field(3, dtype=ti.f64, shape=N)
+vel = ti.Vector.field(3, dtype=ti.f64, shape=N)
+acc = ti.Vector.field(3, dtype=ti.f64, shape=N)
+sim_time = ti.field(dtype=ti.f64, shape=())
+ 
+# Trails (flat 1D fields, because scene.particles needs a 1D field)
+trail_pos = ti.Vector.field(3, dtype=ti.f32, shape=NP * TRAIL_POINTS)
+trail_color = ti.Vector.field(3, dtype=ti.f32, shape=NP * TRAIL_POINTS)
+trail_head = ti.field(dtype=ti.i32, shape=NP)
+trail_count = ti.field(dtype=ti.i32, shape=NP)
+trail_interval = ti.field(dtype=ti.f64, shape=NP)
+next_trail_time = ti.field(dtype=ti.f64, shape=NP)
+ 
+# Orbit-period measurement (heliocentric angle swept since t = 0)
+prev_angle = ti.field(dtype=ti.f64, shape=NP)
+swept_angle = ti.field(dtype=ti.f64, shape=NP)
+first_period_days = ti.field(dtype=ti.f64, shape=NP)
+ 
+render_pos = ti.Vector.field(3, dtype=ti.f32, shape=N)
+ 
+ 
+# Initial conditions
+def central_mass(k):
+    """Sun + all planets interior to planet k + planet k itself.
+    The inner planets add to the pull felt by the outer ones (Jupiter alone is ~0.1 % of the Sun)."""
+    return M_SUN + sum(p[1] for p in PLANETS[: k + 1])
+ 
+ 
+def kepler_period_seconds(k):
+    """Kepler period, T = 2*pi*sqrt(a^3 / (G * central_mass))."""
+    return 2.0 * PI * math.sqrt(PLANETS[k][2] ** 3 / (G * central_mass(k)))
+ 
+ 
+def init_conditions():
+    """Put every planet at its perihelion with the exact vis-viva speed.
+ 
+    Each planet's Kepler orbit is defined around the barycentre of everything
+    interior to it (Sun + inner planets) -- Jacobi coordinates. This is how
+    NASA/JPL mean elements are meant to be used, and it keeps Jupiter..Neptune on
+    the right ellipses even though the Sun wobbles around the barycentre.
+    """
+    masses = np.zeros(N)
+    masses[SUN_IDX] = M_SUN
+    r_jac = np.zeros((NP, 3))    # planet relative to barycentre of the bodies inside it
+    v_jac = np.zeros((NP, 3))
+    frac = np.zeros(NP)          # m_k / (M_interior + m_k)
+ 
+    for k, (name, m, a, e, lon_peri_deg, _, _) in enumerate(PLANETS):
+        mu = G * central_mass(k)
+        r_peri = a * (1.0 - e)
+        v_peri = math.sqrt(mu * (1.0 + e) / (a * (1.0 - e)))   # = sqrt(mu (2/r - 1/a))
+        phi = math.radians(lon_peri_deg)
+        masses[k + 1] = m
+        frac[k] = m / central_mass(k)
+        r_jac[k] = [r_peri * math.cos(phi), r_peri * math.sin(phi), 0.0]
+        v_jac[k] = [-v_peri * math.sin(phi), v_peri * math.cos(phi), 0.0]
+ 
+    positions = np.zeros((N, 3))
+    velocities = np.zeros((N, 3))
+    if FIX_SUN:
+        positions[1:] = r_jac    # Sun stays at the origin, at rest
+        velocities[1:] = v_jac
+    else:
+        # Choose the Sun's state so that the total centre of mass sits at the origin
+        # with zero total momentum, then build the planets outwards from it.
+        positions[SUN_IDX] = -(frac[:, None] * r_jac).sum(axis=0)
+        velocities[SUN_IDX] = -(frac[:, None] * v_jac).sum(axis=0)
+        b_pos = positions[SUN_IDX].copy()   # barycentre of the bodies built so far
+        b_vel = velocities[SUN_IDX].copy()
+        for k in range(NP):
+            positions[k + 1] = b_pos + r_jac[k]
+            velocities[k + 1] = b_vel + v_jac[k]
+            b_pos = b_pos + frac[k] * r_jac[k]
+            b_vel = b_vel + frac[k] * v_jac[k]
+ 
+    mass.from_numpy(masses)
+    pos.from_numpy(positions)
+    vel.from_numpy(velocities)
+    sim_time[None] = 0.0
+ 
+    helio = positions[1:] - positions[SUN_IDX]
+    prev_angle.from_numpy(np.arctan2(helio[:, 1], helio[:, 0]))
+    swept_angle.from_numpy(np.zeros(NP))
+    first_period_days.from_numpy(np.zeros(NP))
+ 
+    intervals = np.array(
+        [max(kepler_period_seconds(k) / TRAIL_POINTS, DT) for k in range(NP)]
+    )
+    trail_interval.from_numpy(intervals)
+    next_trail_time.from_numpy(np.zeros(NP))
+    trail_head.from_numpy(np.zeros(NP, dtype=np.int32))
+    trail_count.from_numpy(np.zeros(NP, dtype=np.int32))
+ 
+    start = (helio / SCALE_VIS).astype(np.float32)
+    trail_pos.from_numpy(np.repeat(start, TRAIL_POINTS, axis=0))
+    trail_color.from_numpy(np.zeros((NP * TRAIL_POINTS, 3), dtype=np.float32))
+ 
+ 
+# Physics kernels
+@ti.func
+def accelerations():
+    for i in range(N):
+        acc[i] = ti.Vector([0.0, 0.0, 0.0])
+        for j in range(N):
+            if i != j:
+                displacement = pos[j] - pos[i]
+                distance_squared = displacement.dot(displacement)
+                distance = ti.sqrt(distance_squared)
+                acc[i] += G * mass[j] * displacement / (distance_squared * distance)
+ 
+ 
+@ti.func
+def view_origin():
+    origin = ti.Vector([0.0, 0.0, 0.0])
+    if ti.static(HELIOCENTRIC_VIEW):
+        origin = pos[SUN_IDX]
+    return origin
+ 
+ 
+@ti.func
+def track_orbits(t_prev: ti.f64, dt: ti.f64):
+    """Measure each planet's sidereal period from the angle it sweeps around the Sun."""
+    for k in range(NP):
+        rel = pos[k + 1] - pos[SUN_IDX]
+        angle = ti.atan2(rel[1], rel[0])
+        d = angle - prev_angle[k]
+        if d > PI:
+            d -= 2.0 * PI
+        if d < -PI:
+            d += 2.0 * PI
+        new_swept = swept_angle[k] + d
+        if first_period_days[k] == 0.0 and new_swept >= 2.0 * PI:
+            frac = (2.0 * PI - swept_angle[k]) / d
+            first_period_days[k] = (t_prev + frac * dt) / 86400.0
+        swept_angle[k] = new_swept
+        prev_angle[k] = angle
+ 
+ 
+@ti.func
+def record_trails():
+    t_now = sim_time[None]
+    origin = view_origin()
+    for k in range(NP):
+        if t_now >= next_trail_time[k]:
+            head = trail_head[k]
+            trail_pos[k * TRAIL_POINTS + head] = ti.cast(
+                (pos[k + 1] - origin) / SCALE_VIS, ti.f32
+            )
+            trail_head[k] = (head + 1) % TRAIL_POINTS
+            if trail_count[k] < TRAIL_POINTS:
+                trail_count[k] += 1
+            next_trail_time[k] += trail_interval[k]
+ 
+ 
+@ti.kernel
+def compute_acceleration():
+    accelerations()
+ 
+ 
+@ti.kernel
+def advance(n_steps: ti.i32, dt: ti.f64, fix_sun: ti.i32):
+    """Velocity-Verlet, n_steps in one call (serial loop -> no Python overhead)."""
+    step = 0
+    while step < n_steps:
+        t_prev = sim_time[None]
+        for i in range(N):
+            if fix_sun == 0 or i != SUN_IDX:
+                vel[i] += 0.5 * dt * acc[i]
+                pos[i] += dt * vel[i]
+        accelerations()
+        for i in range(N):
+            if fix_sun == 0 or i != SUN_IDX:
+                vel[i] += 0.5 * dt * acc[i]
+        sim_time[None] = t_prev + dt
+        track_orbits(t_prev, dt)
+        record_trails()
+        step += 1
+ 
+ 
+@ti.kernel
+def update_render_pos():
+    origin = view_origin()
+    for i in range(N):
+        render_pos[i] = ti.cast((pos[i] - origin) / SCALE_VIS, ti.f32)
+ 
+ 
+@ti.kernel
+def update_trail_colors():
+    """Grey trail; the oldest samples fade towards black (= 'transparent')."""
+    for idx in range(NP * TRAIL_POINTS):
+        k = idx // TRAIL_POINTS
+        slot = idx % TRAIL_POINTS
+        age = (trail_head[k] - 1 - slot + TRAIL_POINTS) % TRAIL_POINTS   # 0 = newest
+        if age < trail_count[k]:
+            b = ti.cast(TRAIL_BRIGHTNESS, ti.f64)
+            if ti.static(TRAIL_FADE):
+                fade = 1.0 - ti.cast(age, ti.f64) / TRAIL_POINTS
+                b = TRAIL_MIN_BRIGHTNESS + (TRAIL_BRIGHTNESS - TRAIL_MIN_BRIGHTNESS) * fade
+            trail_color[idx] = ti.cast(ti.Vector([b, b, b]), ti.f32)
+        else:
+            trail_color[idx] = ti.cast(ti.Vector([0.0, 0.0, 0.0]), ti.f32)
+ 
+ 
+@ti.kernel
+def calculate_energy() -> ti.types.f64:
+    total_energy = ti.cast(0.0, ti.f64)
+    for i in range(N):
+        total_energy += 0.5 * mass[i] * vel[i].dot(vel[i])
+    for i in range(N):
+        for j in range(i + 1, N):
+            displacement = pos[j] - pos[i]
+            distance = ti.sqrt(displacement.dot(displacement))
+            total_energy -= G * mass[i] * mass[j] / distance
+    return total_energy
+ 
+ 
+# Helpers for drawing
+def display_radius(i, cam_radius):
+    """Bodies are hugely exaggerated; keep them readable at every zoom level."""
+    if i == SUN_IDX:
+        base, cap = 0.012 * cam_radius, 0.30
+    else:
+        a_au = PLANETS[i - 1][2] / AU
+        frac = 0.0035 if i <= 4 else 0.004
+        base, cap = frac * cam_radius, 0.15 * a_au
+    return max(min(base, cap), 0.0012 * cam_radius)
+ 
+ 
+def ordered_trail(trails, k):
+    """Return planet k's trail in time order (oldest -> newest), in AU."""
+    head = int(trail_head[k])
+    count = int(trail_count[k])
+    data = trails[k]
+    if count < TRAIL_POINTS:
+        return data[:count]
+    return np.roll(data, -head, axis=0)
+ 
+ 
+def analytic_ellipse(a_m, e, lon_peri_deg, n=721):
+    """Ideal Kepler ellipse (Sun in one focus), in AU."""
+    nu = np.linspace(0.0, 2.0 * PI, n)
+    r = a_m * (1.0 - e ** 2) / (1.0 + e * np.cos(nu)) / AU
+    phi = nu + math.radians(lon_peri_deg)
+    return r * np.cos(phi), r * np.sin(phi)
+ 
+ 
+def main():
+    init_conditions()
+    compute_acceleration()
+    update_render_pos()
+ 
+    initial_energy = calculate_energy()
+    history_t = []
+    history_energy_error = []
+    reported = [False] * NP
+    frame_count = 0
+    energy_error = 0.0
+ 
+    window = ti.ui.Window("3D Solar System", (WIDTH, HEIGHT))
+    canvas = window.get_canvas()
+    scene = window.get_scene()
+    camera = ti.ui.Camera()
+    # Big scene (Neptune ~30 AU): widen the clipping range.
+    for name, value in (("z_near", 0.01), ("z_far", 1000.0)):
+        if hasattr(camera, name):
+            getattr(camera, name)(value)
+ 
+    cam_radius = FULL_VIEW_RADIUS
+    cam_yaw = -PI / 2.0
+    cam_pitch = 0.5
+    speed_log = 0.0              # log10(days per frame) -> 1 day per frame
+    paused = False
+    prev_lmb = False
+    dragging = False
+    last_mouse = (0.0, 0.0)
+    PANEL_W, PANEL_H = 0.40, 0.56
+ 
+    while window.running:
+        # 1. Physics
+        days_per_frame = 10.0 ** speed_log
+        if not paused:
+            n_steps = max(1, int(days_per_frame * 86400.0 / DT))
+            advance(n_steps, DT, int(FIX_SUN))
+            update_trail_colors()
+        update_render_pos()
+ 
+        # 2. Input
+        window.get_events()
+        if window.is_pressed('w'):
+            cam_radius = max(0.15, cam_radius * 0.97)
+        if window.is_pressed('s'):
+            cam_radius = min(150.0, cam_radius * 1.03)
+ 
+        mouse_x, mouse_y = window.get_cursor_pos()
+        over_panel = mouse_x <= PANEL_W + 0.02 and (1.0 - mouse_y) <= PANEL_H + 0.02
+        lmb = window.is_pressed(ti.ui.LMB)
+        if lmb and not prev_lmb:
+            dragging = not over_panel        # don't rotate while using the panel
+            last_mouse = (mouse_x, mouse_y)
+        if lmb and dragging:
+            cam_yaw -= (mouse_x - last_mouse[0]) * 4.0
+            cam_pitch += (mouse_y - last_mouse[1]) * 3.0
+            cam_pitch = min(max(cam_pitch, 0.05), PI - 0.05)
+            last_mouse = (mouse_x, mouse_y)
+        if not lmb:
+            dragging = False
+        prev_lmb = lmb
+ 
+        camera.up(0.0, 0.0, 1.0)     # orbits lie in the X-Y plane
+        camera.position(
+            cam_radius * math.sin(cam_pitch) * math.cos(cam_yaw),
+            cam_radius * math.sin(cam_pitch) * math.sin(cam_yaw),
+            cam_radius * math.cos(cam_pitch),
+        )
+        camera.lookat(0.0, 0.0, 0.0)
+        scene.set_camera(camera)
+ 
+        # 3. Lighting + drawing
+        scene.ambient_light((0.05, 0.05, 0.05))
+        scene.point_light(pos=(0.0, 0.0, 0.0), color=(1.5, 1.5, 1.5))   # lights the planets
+        scene.point_light(pos=(1.0, 1.0, 1.0), color=(1.0, 1.0, 1.0))   # lights the Sun
+ 
+        scene.particles(
+            trail_pos,
+            radius=max(TRAIL_RADIUS_FRAC * cam_radius, 0.0005),
+            color=(TRAIL_BRIGHTNESS,) * 3,
+            per_vertex_color=trail_color,
+        )
+        scene.particles(
+            render_pos, radius=display_radius(SUN_IDX, cam_radius),
+            index_offset=SUN_IDX, index_count=1, color=SUN_COLOR,
+        )
+        for k, planet in enumerate(PLANETS):
+            i = k + 1
+            scene.particles(
+                render_pos, radius=display_radius(i, cam_radius),
+                index_offset=i, index_count=1, color=planet[6],
+            )
+        canvas.scene(scene)
+ 
+        # 4. Diagnostics
+        positions = pos.to_numpy()
+        velocities = vel.to_numpy()
+        sim_days = sim_time[None] / 86400.0
+        current_energy = calculate_energy()
+        energy_error = abs((current_energy - initial_energy) / initial_energy)
+        periods = first_period_days.to_numpy()
+ 
+        for k, planet in enumerate(PLANETS):
+            if periods[k] > 0.0 and not reported[k]:
+                reported[k] = True
+                nasa = planet[5]
+                print(
+                    f"\n*** {planet[0].upper()} HAS COMPLETED ONE ORBIT: "
+                    f"simulated {periods[k]:.3f} d | NASA {nasa:.3f} d | "
+                    f"difference {100.0 * (periods[k] - nasa) / nasa:+.3f} % ***\n"
+                )
+ 
+        if frame_count % 10 == 0:
+            history_t.append(sim_days)
+            history_energy_error.append(energy_error)
+        if frame_count % 60 == 0:
+            print(
+                f"Time: {sim_days:10.2f} days | "
+                f"{sim_days / 365.25:8.2f} yr | E_err: {energy_error:.2e}"
+            )
+ 
+        # 5. UI panel
+        ui = window.get_gui()
+        ui.begin("Simulation Info", 0.01, 0.01, PANEL_W, PANEL_H)
+        ui.text(f"Time: {sim_days:,.1f} days ({sim_days / 365.25:.2f} yr)")
+        ui.text(f"Energy error: {energy_error:.1e}")
+        speed_log = ui.slider_float("log10 days/frame", speed_log, -1.0, 3.0)
+        ui.text(f"Speed: {days_per_frame:.2f} days per frame")
+        paused = ui.checkbox("Paused", paused)
+        if ui.button("Inner planets view"):
+            cam_radius = INNER_VIEW_RADIUS
+        if ui.button("Full system view"):
+            cam_radius = FULL_VIEW_RADIUS
+        for k, planet in enumerate(PLANETS):
+            i = k + 1
+            dist_au = np.linalg.norm(positions[i] - positions[SUN_IDX]) / AU
+            speed_kms = np.linalg.norm(velocities[i] - velocities[SUN_IDX]) / 1000.0
+            ui.text(f"{planet[0]}: {dist_au:.3f} AU | {speed_kms:.2f} km/s")
+        ui.text("Left-drag: rotate | W / S: zoom")
+        ui.end()
+ 
+        window.show()
+        frame_count += 1
+ 
+    # Validation graphs: simulated orbits vs. ideal Kepler ellipses (NASA a, e)
+    print("Simulation ended. Plotting validation graphs...")
+    trails = trail_pos.to_numpy().reshape(NP, TRAIL_POINTS, 3)
+ 
+    figure, (axis_full, axis_inner, axis_energy) = plt.subplots(1, 3, figsize=(18, 6))
+    for axis, limit, title in (
+        (axis_full, 32.0, "All planets (simulated = solid, ideal ellipse = dashed)"),
+        (axis_inner, 1.8, "Inner planets (zoom)"),
+    ):
+        for k, planet in enumerate(PLANETS):
+            colour = planet[6]
+            ex, ey = analytic_ellipse(planet[2], planet[3], planet[4])
+            axis.plot(ex, ey, "--", color=colour, linewidth=0.8, alpha=0.6)
+            trail = ordered_trail(trails, k)
+            if len(trail) > 1:
+                axis.plot(trail[:, 0], trail[:, 1], color=colour, linewidth=1.6, label=planet[0])
+        axis.plot([0], [0], "yo", markersize=8)
+        axis.set_xlim(-limit, limit)
+        axis.set_ylim(-limit, limit)
+        axis.set_aspect("equal", "box")
+        axis.set_xlabel("X (AU)")
+        axis.set_ylabel("Y (AU)")
+        axis.set_title(title, fontsize=10)
+        axis.grid(True, alpha=0.3)
+    axis_full.legend(frameon=False, fontsize=8, loc="upper right")
+ 
+    axis_energy.plot(history_t, history_energy_error, color="red")
+    axis_energy.set_xlabel("Time (days)")
+    axis_energy.set_ylabel("Relative Energy Error |(E-E0)/E0|")
+    axis_energy.set_title(f"Energy Conservation (dt={DT:.0f}s)")
+    axis_energy.set_yscale("log")
+    axis_energy.grid(True)
+    figure.tight_layout()
+    plt.show()
+ 
+ 
+if __name__ == "__main__":
+    main()
